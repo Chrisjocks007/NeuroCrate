@@ -1,5 +1,5 @@
-;; AI Model Collaboration Platform
-;; Stage 2: Adding contribution system with model improvements
+;; Decentralized AI Model Collaboration Platform
+;; A Clarity smart contract for collaborative AI model development and governance
 
 ;; Constants
 (define-constant ERR-NOT-ADMINISTRATOR (err u1))
@@ -9,17 +9,20 @@
 (define-constant ERR-INVALID-PARAMETER (err u5))
 (define-constant ERR-INSUFFICIENT-REPUTATION (err u6))
 (define-constant ERR-MODEL-EXISTS (err u7))
+(define-constant ERR-ALREADY-VOTED (err u8))
 (define-constant ERR-NOT-AUTHORIZED (err u9))
 (define-constant ERR-CONTRIBUTION-NOT-FOUND (err u10))
 (define-constant MAX-MODEL-ID u1000) ;; Maximum allowed model ID
 (define-constant MIN-REPUTATION-REQUIRED u10) ;; Minimum reputation to register
 (define-constant MAX-REPUTATION-INPUT u1000000) ;; Maximum reputation input allowed
+(define-constant MAX-CONSENSUS-THRESHOLD u100) ;; Maximum consensus threshold (100%)
 
 ;; Data Variables
 (define-data-var platform-administrator principal tx-sender)
 (define-data-var platform-online bool false)
 (define-data-var collaboration-cycle uint u0)
 (define-data-var minimum-reputation-threshold uint u100) ;; 100 reputation points minimum
+(define-data-var consensus-threshold uint u66) ;; 66% approval required for integration
 
 ;; AI Model Structure
 (define-map ai-models
@@ -31,7 +34,7 @@
         task-domain: (string-utf8 64),
         contributions-open: bool,
         creator: principal,
-        total-reputation: uint,
+        total-reputation: uint,       ;; Sum of reputation of all contributors
         integrated-contributions: uint ;; Counter of accepted contributions
     }
 )
@@ -51,7 +54,7 @@
         reputation: uint,
         models-contributed: (list 30 uint),
         contributions-submitted: (list 30 uint),
-        voting-power: uint
+        voting-power: uint           ;; Derived from reputation but can be modified
     }
 )
 
@@ -65,6 +68,25 @@
         target-model: uint,
         submitted-in-cycle: uint,
         integrated: bool
+    }
+)
+
+;; Contribution Votes
+(define-map contribution-votes
+    {contribution-id: uint, voter: principal}
+    {
+        approved: bool,
+        weight: uint
+    }
+)
+
+;; Vote Tallies for Contributions
+(define-map vote-tallies
+    uint  ;; contribution-id
+    {
+        approval-weight: uint,
+        rejection-weight: uint,
+        total-votes: uint
     }
 )
 
@@ -98,6 +120,7 @@
     (task-domain (string-utf8 64)))
     (let (
         (researcher-profile (unwrap! (map-get? researcher-profiles tx-sender) ERR-INSUFFICIENT-REPUTATION))
+        (validated-hash (if (is-valid-hash version-hash) version-hash 0x))
         )
         
         ;; Check platform status
@@ -125,7 +148,7 @@
             {
                 model-name: model-name,
                 description: description,
-                version-hash: version-hash,
+                version-hash: validated-hash,
                 task-domain: task-domain,
                 contributions-open: true,
                 creator: tx-sender,
@@ -205,6 +228,14 @@
                 integrated: false
             })
         
+        ;; Initialize vote tally
+        (map-set vote-tallies contribution-id
+            {
+                approval-weight: u0,
+                rejection-weight: u0,
+                total-votes: u0
+            })
+        
         ;; Update researcher's submitted contributions
         (map-set researcher-profiles tx-sender
             (merge researcher {
@@ -215,10 +246,66 @@
         
         (ok true)))
 
-;; Process Contribution (admin only in this version)
-(define-public (process-contribution (contribution-id uint) (approve bool))
+;; Vote on Contribution
+(define-public (vote-on-contribution
+    (contribution-id uint)
+    (approve bool))
     (let (
         (contribution (unwrap! (map-get? model-contributions contribution-id) ERR-CONTRIBUTION-NOT-FOUND))
+        (researcher (unwrap! (map-get? researcher-profiles tx-sender) ERR-INSUFFICIENT-REPUTATION))
+        (vote-tally (unwrap! (map-get? vote-tallies contribution-id) ERR-CONTRIBUTION-NOT-FOUND))
+        )
+        
+        ;; Check platform status
+        (asserts! (var-get platform-online) ERR-PLATFORM-OFFLINE)
+        
+        ;; Ensure contribution hasn't already been integrated
+        (asserts! (not (get integrated contribution)) ERR-MODEL-LOCKED)
+        
+        ;; Check researcher hasn't already voted
+        (asserts! (is-none (map-get? contribution-votes 
+                                    {contribution-id: contribution-id, voter: tx-sender})) 
+                ERR-ALREADY-VOTED)
+        
+        ;; Record the vote
+        (map-set contribution-votes 
+            {contribution-id: contribution-id, voter: tx-sender}
+            {
+                approved: approve,
+                weight: (get voting-power researcher)
+            })
+        
+        ;; Update vote tally
+        (map-set vote-tallies contribution-id
+            (merge vote-tally {
+                approval-weight: (if approve 
+                                    (+ (get approval-weight vote-tally) (get voting-power researcher))
+                                    (get approval-weight vote-tally)),
+                rejection-weight: (if (not approve)
+                                    (+ (get rejection-weight vote-tally) (get voting-power researcher))
+                                    (get rejection-weight vote-tally)),
+                total-votes: (+ (get total-votes vote-tally) u1)
+            }))
+        
+        (ok true)))
+
+;; Finalize Contributions at the end of a cycle
+(define-public (finalize-contributions)
+    (begin
+        ;; Only administrator can finalize contributions
+        (asserts! (is-administrator) ERR-NOT-AUTHORIZED)
+        (asserts! (var-get platform-online) ERR-PLATFORM-OFFLINE)
+        
+        ;; Advance collaboration cycle
+        (var-set collaboration-cycle (+ (var-get collaboration-cycle) u1))
+        
+        (ok true)))
+
+;; Process Specific Contribution
+(define-public (process-contribution (contribution-id uint))
+    (let (
+        (contribution (unwrap! (map-get? model-contributions contribution-id) ERR-CONTRIBUTION-NOT-FOUND))
+        (vote-tally (unwrap! (map-get? vote-tallies contribution-id) ERR-CONTRIBUTION-NOT-FOUND))
         (model (unwrap! (map-get? ai-models (get target-model contribution)) ERR-INVALID-MODEL))
         (contributor (unwrap! (map-get? researcher-profiles (get contributor contribution)) ERR-INVALID-PARAMETER))
         )
@@ -230,8 +317,12 @@
         ;; Ensure contribution hasn't already been integrated
         (asserts! (not (get integrated contribution)) ERR-MODEL-LOCKED)
         
-        ;; Process the contribution based on approval
-        (if approve
+        ;; Check for sufficient votes and meeting threshold
+        (if (and 
+                (> (+ (get approval-weight vote-tally) (get rejection-weight vote-tally)) u0)
+                (>= (* (get approval-weight vote-tally) u100) 
+                    (* (+ (get approval-weight vote-tally) (get rejection-weight vote-tally)) (var-get consensus-threshold)))
+            )
             (begin
                 ;; Update contribution status
                 (map-set model-contributions contribution-id
@@ -245,8 +336,7 @@
                     }))
                 
                 ;; Add contributor to model contributors if not already
-                (match (map-get? model-contributors 
-                        {model-id: (get target-model contribution), contributor: (get contributor contribution)})
+                (match (map-get? model-contributors {model-id: (get target-model contribution), contributor: (get contributor contribution)})
                     existing-contribution
                     true
                     ;; Add new contributor
@@ -268,7 +358,7 @@
                     }))
                 
                 (ok true))
-            (ok false)))) ;; No action if rejected
+            (ok false)))) ;; No action if threshold not met
 
 ;; Change Model Contribution Status
 (define-public (set-model-contributions-status (model-id uint) (open bool))
@@ -298,11 +388,15 @@
 (define-read-only (get-contribution-details (contribution-id uint))
     (map-get? model-contributions contribution-id))
 
+(define-read-only (get-contribution-votes (contribution-id uint))
+    (map-get? vote-tallies contribution-id))
+
 (define-read-only (get-platform-metrics)
     {
         online: (var-get platform-online),
         collaboration-cycle: (var-get collaboration-cycle),
-        minimum-reputation: (var-get minimum-reputation-threshold)
+        minimum-reputation: (var-get minimum-reputation-threshold),
+        consensus-threshold: (var-get consensus-threshold)
     })
 
 (define-public (update-minimum-reputation (new-minimum uint))
@@ -313,11 +407,12 @@
         (var-set minimum-reputation-threshold new-minimum)
         (ok true)))
 
-(define-public (advance-collaboration-cycle)
+(define-public (update-consensus-threshold (new-percentage uint))
     (begin
         (asserts! (is-administrator) ERR-NOT-ADMINISTRATOR)
-        (asserts! (var-get platform-online) ERR-PLATFORM-OFFLINE)
-        (var-set collaboration-cycle (+ (var-get collaboration-cycle) u1))
+        ;; Validate percentage is between 1 and 100
+        (asserts! (and (> new-percentage u0) (<= new-percentage MAX-CONSENSUS-THRESHOLD)) ERR-INVALID-PARAMETER)
+        (var-set consensus-threshold new-percentage)
         (ok true)))
 
 (define-public (shutdown-platform)
